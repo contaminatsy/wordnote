@@ -29,6 +29,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Tab
 import androidx.compose.runtime.collectAsState
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.collectAsState
 import android.widget.Toast
 import android.content.Context
 import androidx.room.*
@@ -448,13 +452,153 @@ fun WordItemCard(
 
 @Composable
 fun TestScreen(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val db = remember { AppDatabase.getDatabase(context) }
+    // 订阅数据源
+    val allWords by db.wordDao().getAllWords().collectAsState(initial = emptyList())
+
+    val coroutineScope = rememberCoroutineScope()
+
+    // UI 交互状态调度
+    var currentWord by remember { mutableStateOf<WordEntity?>(null) }
+    var options by remember { mutableStateOf<List<String>>(emptyList()) }
+    var selectedOption by remember { mutableStateOf<String?>(null) }
+
+    // 核心管线：生成下一道题目
+    fun generateNextQuestion() {
+        if (allWords.size >= 4) {
+            val target = allWords.filter { it != currentWord }.random()
+            // 提取简短释义（取第一行）作为正确选项
+
+            val correctOption = target.translation.split("\n").firstOrNull() ?: target.translation
+
+            // 从词库里随机抓 3 个不一样的词作为干扰项
+            val wrongWords = allWords.filter { it.word != target.word }.shuffled().take(3)
+            val wrongOptions = wrongWords.map { it.translation.split("\n").firstOrNull() ?: it.translation }
+
+            // 装填弹药并打乱顺序
+            currentWord = target
+            options = (wrongOptions + correctOption).shuffled()
+            selectedOption = null // 重置玩家选择
+        }
+    }
+
+    // 将题目中的单词标记为彻底掌握
+    fun masterWord(word: WordEntity) {
+        coroutineScope.launch {
+            // 1. 统一参数名为 word，2. 单向锁定状态为 true
+            val updatedWord = word.copy(isMastered = true)
+            db.wordDao().updateWord(updatedWord)
+
+            // 3. 顺手做一个体验优化：点完“已掌握”后，直接自动跳转到下一题！
+            generateNextQuestion()
+        }
+    }
+
+
+
+    // 监听数据池加载，只要词库满 4 个词，立刻初始化第一题
+    LaunchedEffect(allWords) {
+        if (allWords.size >= 4 && currentWord == null) {
+            generateNextQuestion()
+        }
+    }
+
     Column(
         modifier = modifier.fillMaxSize().padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text("✏️ 测试页面", fontSize = 24.sp)
-        Text("仿百词斩/多邻国趣味测试（开发中...）", fontSize = 14.sp, color = MaterialTheme.colorScheme.outline)
+        Text("✏️ 趣味测试", fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(16.dp))
+
+        // 拦截条件：词库太少玩不了
+        if (allWords.size < 4) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    text = "你的词库还不够丰富（至少需要 4 个单词），\n快去查询页面多加几个词来解锁测试吧！",
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.outline
+                )
+            }
+        } else {
+            // 游戏主场景
+            currentWord?.let { targetWord ->
+                // 题目展示卡片
+                Card(
+                    modifier = Modifier.fillMaxWidth().height(200.dp).padding(vertical = 16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                    elevation = CardDefaults.cardElevation(4.dp)
+                ) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(text = targetWord.word, fontSize = 40.sp, fontWeight = FontWeight.Bold)
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(text = targetWord.phonetic, fontSize = 18.sp, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // 答题选项网格 (4选1)
+                val correctOption = targetWord.translation.split("\n").firstOrNull() ?: targetWord.translation
+
+                options.forEach { optionText ->
+                    val isSelected = selectedOption == optionText
+                    val isCorrect = optionText == correctOption
+
+                    // 动态结算颜色：选对标绿，选错标红，没点时保持默认色
+                    val buttonColor = if (selectedOption != null) {
+                        if (isCorrect) Color(0xFF4CAF50)
+                        else if (isSelected) Color(0xFFE53935)
+                        else MaterialTheme.colorScheme.surfaceVariant
+                    } else {
+                        MaterialTheme.colorScheme.surfaceVariant
+                    }
+
+                    Button(
+                        onClick = {
+                            // 锁死机制：只有没选过的情况下才允许点击，防止反复选
+                            if (selectedOption == null) selectedOption = optionText
+                        },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(56.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = buttonColor),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text(
+                            text = optionText,
+                            fontSize = 15.sp,
+                            color = if (selectedOption != null && (isCorrect || isSelected)) Color.White else MaterialTheme.colorScheme.onSurface,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.weight(1f))
+
+                // 下一题按钮 (只有答题结算后才会弹出)
+                AnimatedVisibility(visible = selectedOption != null) {
+                    Button(
+                        onClick = { generateNextQuestion() },
+                        modifier = Modifier.fillMaxWidth().height(50.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) {
+                        Text("下一题 ➔", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Spacer(modifier = Modifier.weight(1f))
+
+                //记住按钮
+                TextButton(
+                    onClick = {
+                        currentWord?.let { masterWord(it) }
+                    },
+                    modifier = Modifier.fillMaxWidth().height(50.dp)
+                ) {
+                    Text("✅ 太简单了，标记为已掌握", fontSize = 16.sp, color = Color(0xFF4CAF50))
+                }
+            }
+        }
     }
 }
 
