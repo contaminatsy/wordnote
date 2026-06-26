@@ -59,5 +59,7 @@ dependencies {
     implementation("com.squareup.retrofit2:converter-gson:2.11.0")
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
+    // Google ML Kit 离线文本识别 (拉丁字母体系，专攻英文)
+    implementation("com.google.mlkit:text-recognition:16.0.1")
     ksp(libs.androidx.room.compiler)
 }

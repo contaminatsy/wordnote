@@ -33,11 +33,26 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.collectAsState
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import android.widget.Toast
 import android.content.Context
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.Nullable
 import androidx.room.*
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 import com.example.wordnote2.ui.theme.Wordnote2Theme
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.GET
@@ -101,6 +116,61 @@ enum class AppDestinations(
     TEST("测试", R.drawable.ic_account_box),
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun OcrSentenceSelector(
+    ocrText: String, // 假设这是 ML Kit 刚扫描出来的原始字符串
+    onWordSelected: (String, String) -> Unit // 回调：传出被点击的(纯净单词, 完整例句)
+) {
+    // 选中的单词高亮状态
+    var selectedWordIndex by remember { mutableStateOf<Int?>(null) }
+
+    // 将长句子按空格切分成单词数组
+    val words = ocrText.split(Regex("\\s+"))
+
+    Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+        Text("✨ 扫描结果 (点击单词查词典)", fontSize = 14.sp, color = MaterialTheme.colorScheme.primary)
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            // FlowRow 会像文本排版一样，自动把放不下的单词折行到下一行
+            FlowRow(
+                modifier = Modifier.padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp), // 单词水平间距
+                verticalArrangement = Arrangement.spacedBy(8.dp)   // 行间距
+            ) {
+                words.forEachIndexed { index, word ->
+                    // 动态颜色：选中的词高亮标绿，没选中的保持默认色
+                    val isSelected = selectedWordIndex == index
+                    val textColor = if (isSelected) Color(0xFF4CAF50) else MaterialTheme.colorScheme.onSurfaceVariant
+                    val fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+
+                    Text(
+                        text = word,
+                        fontSize = 18.sp,
+                        color = textColor,
+                        fontWeight = fontWeight,
+                        modifier = Modifier
+                            .clickable {
+                                selectedWordIndex = index
+                                // 过滤掉标点符号，只保留纯字母用来查接口 (比如把 "hello," 变成 "hello")
+                                val cleanWord = word.replace(Regex("[^A-Za-z]"), "")
+                                if (cleanWord.isNotEmpty()) {
+                                    // 触发回调，把单词和整个句子一起传给外部去处理
+                                    onWordSelected(cleanWord, ocrText)
+                                }
+                            }
+                            .padding(horizontal = 2.dp, vertical = 2.dp) // 给点击热区加点缓冲
+                    )
+                }
+            }
+        }
+    }
+}
+
 
 
 @Composable
@@ -118,6 +188,38 @@ fun SearchScreen(modifier: Modifier = Modifier) {
 
     // 获取协程作用域，用来在点击按钮时开启异步线程
     val coroutineScope = rememberCoroutineScope()
+    // 🌟 新增 1：模拟 OCR 刚扫描出来的生肉文本。如果有值，界面上就弹出那个单词选择器。
+    var scannedText by remember { mutableStateOf<String?>(null) }
+    // 🌟 新增 2：用来暂存用户点击后，准备带入数据库的那个完整例句。
+    var pendingCustomExample by remember { mutableStateOf<String?>(null) }
+
+    // 🌟 真实 OCR 新增 1：获取上下文和 ML Kit 文本识别客户端
+    val recognizer = remember { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+
+// 🌟 真实 OCR 新增 2：注册一个“照片选择器” (替代繁琐的权限申请)
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        // 当用户在相册里选好图片后，代码会走到这里
+        if (uri != null) {
+            try {
+                // 1. 把图片 Uri 转换成 ML Kit 认识的格式
+                val image = InputImage.fromFilePath(context, uri)
+                // 2. 塞进识别引擎开始扫描
+                recognizer.process(image)
+                    .addOnSuccessListener { visionText ->
+                        // 3. 扫描成功！把真实提取出的长串文字交给我们的 UI 去渲染
+                        scannedText = visionText.text
+                    }
+                    .addOnFailureListener { e ->
+                        // 失败了（比如图片不清晰）
+                        Toast.makeText(context, "识别失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
 
     Column(
         modifier = modifier
@@ -149,7 +251,10 @@ fun SearchScreen(modifier: Modifier = Modifier) {
             )
             Spacer(modifier = Modifier.width(8.dp))
             FilledIconButton(
-                onClick = { /* 拍照逻辑 */ },
+                onClick = { photoPickerLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                          },
                 modifier = Modifier.size(56.dp),
                 shape = RoundedCornerShape(12.dp)
             ) {
@@ -157,11 +262,25 @@ fun SearchScreen(modifier: Modifier = Modifier) {
             }
         }
 
+        scannedText?.let { text ->
+            OcrSentenceSelector(
+                ocrText = text,
+                onWordSelected = { word, fullSentence ->
+                    searchQuery = word               // 第一步：把提取到的干净单词塞进搜索框
+                    pendingCustomExample = fullSentence // 第二步：把原句存起来，等会儿存数据库用
+//                    scannedText = null               // 第三步：功成身退，把选择器隐藏掉
+
+                    // 💡 提示：如果你的查词网络请求封装成了一个独立函数，你甚至可以在这里直接调用它，实现“点击单词 -> 瞬间出释义”的顺滑体验！
+                }
+            )
+        }
+
         Spacer(modifier = Modifier.height(16.dp))
 
         // 查询按钮
         Button(
             onClick = {
+                scannedText = null
                 if (searchQuery.isNotBlank()) {
                     // 开启协程在后台线程请求网络
                     coroutineScope.launch {
@@ -285,11 +404,13 @@ fun SearchScreen(modifier: Modifier = Modifier) {
                                 val newWord = WordEntity(
                                     word = wordTitle,
                                     phonetic = wordPhonetic,
-                                    translation = compactTranslation
+                                    translation = compactTranslation,
+                                    customizedExample = pendingCustomExample ?: ""
                                 )
 
                                 // 4. 执行写入
                                 db.wordDao().insertWord(newWord)
+                                pendingCustomExample = null
 
                                 // 5. 在主线程弹出成功提示
                                 Toast.makeText(context, "✅ 成功加入单词本！", Toast.LENGTH_SHORT).show()
@@ -381,6 +502,14 @@ fun ReviewScreen(modifier: Modifier = Modifier) {
                                 val updatedWord = wordEntity.copy(isMastered = !wordEntity.isMastered)
                                 db.wordDao().updateWord(updatedWord)
                             }
+                        },
+                        onUpdateExample = { newExample ->
+                            coroutineScope.launch {
+                                // 使用 copy 替换掉 customizedExample 字段，其它字段保留原样
+                                val updatedWord = wordEntity.copy(customizedExample = newExample)
+                                // 覆盖写入数据库！
+                                db.wordDao().updateWord(updatedWord)
+                            }
                         }
                     )
                 }
@@ -394,10 +523,14 @@ fun ReviewScreen(modifier: Modifier = Modifier) {
 fun WordItemCard(
     word: WordEntity,
     onDeleteClick: () -> Unit,
-    onToggleMastered: () -> Unit
+    onToggleMastered: () -> Unit,
+    onUpdateExample: (String) -> Unit
 ) {
     var expanded by remember { mutableStateOf(false) }
-
+    // 👈 新增：控制是否显示输入框
+    var isEditing by remember { mutableStateOf(false) }
+    // 👈 新增：绑定输入框的文本状态，初始值是数据库里存的例句
+    var editExampleText by remember { mutableStateOf(word.customizedExample ?: "") }
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -444,6 +577,58 @@ fun WordItemCard(
                         lineHeight = 22.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    if (isEditing) {
+                        // 状态 A：编辑模式 (显示输入框和保存按钮)
+                        OutlinedTextField(
+                            value = editExampleText,
+                            onValueChange = { editExampleText = it },
+                            label = { Text("编写我的例句") },
+                            modifier = Modifier.fillMaxWidth(),
+                            // 让输入框支持多行
+                            maxLines = 3
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End
+                        ) {
+                            TextButton(onClick = {
+                                isEditing = false
+                                editExampleText = word.customizedExample ?: "" // 取消时，把文本重置回修改前的状态
+                            }) {
+                                Text("取消", color = MaterialTheme.colorScheme.outline)
+                            }
+                            TextButton(onClick = {
+                                onUpdateExample(editExampleText) // 把写好的文本传给外部去写数据库
+                                isEditing = false // 退出编辑模式
+                            }) {
+                                Text("💾 保存")
+                            }
+                        }
+                    } else {
+                        // 状态 B：展示模式 (显示例句文本和修改按钮)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("✍️ 我的例句：", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                                val displayStr = if (word.customizedExample.isNullOrEmpty()) "点击右侧按钮添加属于你的例句..." else word.customizedExample
+                                Text(
+                                    text = displayStr,
+                                    fontSize = 14.sp,
+                                    color = if (word.customizedExample.isNullOrEmpty()) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            // 呼出编辑框的铅笔按钮
+                            IconButton(onClick = { isEditing = true }) {
+                                Text("✏️", fontSize = 18.sp)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -610,7 +795,8 @@ data class WordEntity(
     val phonetic: String,
     val translation: String, // 为了方便存储，我们会把复杂的释义拼接成一段文本存进这个字段
     val addedTime: Long = System.currentTimeMillis(), // 记录存入时间，以后复习页面可以按时间倒序排列
-    val isMastered: Boolean = false // 👈 新增：默认刚加入的单词都是“未掌握”
+    val isMastered: Boolean = false, // 👈 新增：默认刚加入的单词都是“未掌握”
+    val customizedExample: String // 自定义的例句
 )
 
 // 2. DAO（数据访问对象）：定义数据库的增删改查操作
@@ -632,7 +818,7 @@ interface WordDao {
 }
 
 // 3. Database（数据库引擎实例）：单例模式
-@Database(entities = [WordEntity::class], version = 2, exportSchema = false)
+@Database(entities = [WordEntity::class], version = 3, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun wordDao(): WordDao
 
@@ -648,10 +834,18 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "wordnote_database" // 这是保存在手机存储里的真实物理文件名
                 )
-                    .fallbackToDestructiveMigration(false) // 👈 新增：允许清空旧表重建新表，防止崩溃
-                    .build()
+                .addMigrations(MIGRATION_2_3)
+                .build()
                 INSTANCE = instance
                 instance
+            }
+        }
+
+        // 👈 新增：定义从版本 2 到版本 3 的数据转移管线
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // 使用标准的 SQLite 语句，向现有的表中追加新列，并给定一个默认的空字符串值防止 Null 冲突
+                db.execSQL("ALTER TABLE words_table ADD COLUMN customizedExample TEXT NOT NULL DEFAULT ''")
             }
         }
     }
